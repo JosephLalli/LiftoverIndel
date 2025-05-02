@@ -226,12 +226,12 @@ if unlifted_vcf is None:
 if ref_alignment is None:
     raise AttributeError("need a reference alignment")
 if out_vcf is None:
-    out_vcf = '/mnt/ssd/lalli/phasing_T2T/liftover_071224/lifted.bcf'
+    out_vcf = '/dev/stdout'
 if chain is None:
-    chain = '/dev/shm/chm13v2-hg38.over.chain'
+    raise AttributeError("need a chainfile")
 if target_fasta is None:
-    target_fasta='/dev/shm/GRCh38_full_analysis_set_plus_decoy_hla.fasta'
-
+    raise AttributeError("need a target fasta file")
+    
 
 if out_vcf == '/dev/stdout':
     out_vcf = '-'
