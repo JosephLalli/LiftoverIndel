@@ -705,6 +705,7 @@ for pos, variants in tqdm(iterate_over_positions(invcf), total=get_num_unique_po
     if not lifted_records:
         continue
 
+    already_flipped = False
     for var, lifted_start, lifted_end in lifted_records:
         chrom = lifted_start[0]
         span_start = min(lifted_start[1], lifted_end[1])
@@ -727,7 +728,9 @@ for pos, variants in tqdm(iterate_over_positions(invcf), total=get_num_unique_po
                     new_pos, new_ref, new_alt = realigned
                     var.set_pos(new_pos)
                     if new_ref == new_alt:
+                        assert not already_flipped, f"double flip at {var.CHROM}:{var.POS}"
                         var = flip_variant(var, variants)
+                        already_flipped = True
                     else:
                         var.REF = new_ref
                         var.ALT = [new_alt]
@@ -742,7 +745,9 @@ for pos, variants in tqdm(iterate_over_positions(invcf), total=get_num_unique_po
                     lifted_end[1],
                 )
                 if new_ref == new_alt:
+                    assert not already_flipped, f"double flip at {var.CHROM}:{var.POS}"
                     var = flip_variant(var, variants)
+                    already_flipped = True
                 else:
                     var.REF = new_ref
                     var.ALT = [new_alt]
