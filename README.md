@@ -29,27 +29,27 @@ Dependencies:
 Once requirements are installed:
 ```
 python3 liftover_indels.py \
-    vcf_to_lift.bcf \
-    vcf_of_assembly_differences.bcf \
-    lifted_over_output.bcf \
-    chainfile.chain \
-    target_fasta.fasta \
+    --input-vcf vcf_to_lift.bcf \
+    --ref-diffs-vcf vcf_of_assembly_differences.bcf \
+    --output-vcf lifted_over_output.bcf \
+    --chain chainfile.chain \
+    --target-fasta target_fasta.fasta \
     [options]
 ```
 
 For example, to lift only chr22 with debug logging and 4 reader threads:
 ```
 python3 liftover_indels.py \
-    input.bcf \
-    chm13v2-grch38.sort.bcf \
-    output.bcf \
-    chm13v2-grch38.chain \
-    GRCh38.fasta \
+    --input-vcf input.bcf \
+    --ref-diffs-vcf chm13v2-grch38.sort.bcf \
+    --output-vcf output.bcf \
+    --chain chm13v2-grch38.chain \
+    --target-fasta GRCh38.fasta \
     --chrom chr22 --debug --threads 4
 ```
 
-- `vcf_of_assembly_differences.bcf` must be in **target** assembly coordinates.
-- `lifted_over_output.bcf` can be set to `/dev/stdout` for piping.
+- `--ref-diffs-vcf` must be in **target** assembly coordinates.
+- `--output-vcf` can be set to `/dev/stdout` or `-` for piping.
 - Run `python3 liftover_indels.py --help` for full option details.
 
 ### Options

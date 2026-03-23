@@ -23,15 +23,15 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
-    parser.add_argument("input_vcf",
+    parser.add_argument("--input-vcf", required=True,
         help="VCF/BCF file to lift over")
-    parser.add_argument("ref_diffs_vcf",
+    parser.add_argument("--ref-diffs-vcf", required=True,
         help="VCF/BCF of assembly differences (must be in target assembly coordinates)")
-    parser.add_argument("output_vcf",
+    parser.add_argument("--output-vcf", required=True,
         help="Output VCF/BCF path. Use /dev/stdout or - for stdout")
-    parser.add_argument("chain",
+    parser.add_argument("--chain", required=True,
         help="Chain file for coordinate liftover")
-    parser.add_argument("target_fasta",
+    parser.add_argument("--target-fasta", required=True,
         help="Target reference FASTA (may be gzipped)")
 
     parser.add_argument("--chrom", nargs="+", default=None,
@@ -613,7 +613,7 @@ out_vcf = args.output_vcf
 chain = args.chain
 target_fasta = args.target_fasta
 
-if out_vcf == '/dev/stdout':
+if out_vcf in ('/dev/stdout', '-'):
     out_vcf = '-'
     mode='wbu'
 else:
