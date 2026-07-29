@@ -12,6 +12,8 @@ from collections import defaultdict
 from Bio import SeqIO
 import subprocess
 
+__version__ = "1.0.1"
+
 
 class Unliftable(Exception):
     pass
@@ -22,6 +24,8 @@ def parse_args():
         description="Liftover variants between genome references in an indel-aware manner.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+
+    parser.add_argument("--version", action="version", version=__version__)
 
     parser.add_argument("--input-vcf", required=True,
         help="VCF/BCF file to lift over")
@@ -107,8 +111,25 @@ def add_original_info_tags(var):
     var.INFO["SRC_REF_ALT"] = f"{var.REF},{var.ALT[0]}"
     return var
 
+
+def trim_identical_suffix(ref, alt):
+    """Trim the maximal shared suffix while retaining a valid allele base."""
+    while len(ref) > 1 and len(alt) > 1 and ref[-1] == alt[-1]:
+        ref = ref[:-1]
+        alt = alt[:-1]
+    return ref, alt
+
+
+def preprocess_variant(var):
+    """Normalize a non-normalized input allele without changing its position."""
+    ref, alt = trim_identical_suffix(var.REF, var.ALT[0])
+    var.REF = ref
+    var.ALT = [alt]
+    return var
+
 def perform_clean_liftover(var, liftover_obj, return_coordinates=False):
     var = add_original_info_tags(var)
+    var = preprocess_variant(var)
     new_start = liftover_obj.convert_coordinate(var.CHROM, var.start)
     new_end = liftover_obj.convert_coordinate(var.CHROM, var.end)
     new_ref = var.REF
@@ -129,7 +150,7 @@ def perform_clean_liftover(var, liftover_obj, return_coordinates=False):
             new_ref = rev_comp(var.REF)
             new_alt = rev_comp(var.ALT[0])
         var.REF = new_ref
-        var.ALT = new_alt
+        var.ALT = [new_alt]
     var.CHROM = new_start[0]
     var.set_pos(new_start[1])
     if not return_coordinates:
@@ -144,7 +165,7 @@ def revert_variant(var):
     var.CHROM=original_contig
     var.set_pos(original_pos-1)
     var.REF=original_ref
-    var.ALT=original_alt
+    var.ALT=[original_alt]
     return var
 
 def flip_variant(var, all_variants_at_site):
