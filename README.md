@@ -196,11 +196,12 @@ liftover_indels_engine *engine = liftover_indels_open(
 if (!engine) { /* report error, then liftover_indels_string_free(error) */ }
 
 liftover_indels_result r;
+liftover_indels_result_init(&r);   // so dispose is safe even if no lift runs
 if (liftover_indels_lift(engine, "chr21", pos0, "AAAT", "A", 0, &r)
         == LIFTOVER_INDELS_STATUS_OK) {
     // r.chrom, r.pos (0-based), r.ref_allele, r.alt_allele, r.flipped, r.realigned
 }
-liftover_indels_result_dispose(&r);
+liftover_indels_result_dispose(&r);   // frees all of the strings together
 liftover_indels_close(engine);
 ```
 
@@ -215,19 +216,33 @@ c++ -std=c++17 -O2 -I include app.cpp \
 Notes:
 
 - Loading dominates the cost of a lift, so build one engine and reuse it. Naming
-  only the contigs you need keeps the rest of the target reference out of memory.
+  only the contigs you need keeps the rest of the target reference out of memory;
+  passing `NULL`, or `n_chroms == 0`, loads every contig.
 - `liftover_indels_lift` takes a `const` engine and does not mutate it, so one
-  engine can be shared by several threads lifting concurrently.
-- Every `char *` returned is owned by the caller. Release a result with
-  `liftover_indels_result_dispose` and the error string with
-  `liftover_indels_string_free`.
+  engine can be shared by several threads lifting concurrently. A unit test
+  asserts `Engine: Send + Sync` so this cannot regress silently.
+- A result owns its strings and they are freed **only** by
+  `liftover_indels_result_dispose`, which releases all of them together. Never
+  free an individual field; `liftover_indels_string_free` is for one thing, the
+  error string `liftover_indels_open` writes on failure.
+- `dispose` frees whatever the struct holds and cannot tell an uninitialised
+  pointer from `NULL`, so initialise a result with `liftover_indels_result_init`
+  (or `= {0}`) before any path that might dispose it without lifting.
+- `lift` overwrites a result without freeing what was there, so reusing one across
+  lifts leaks unless you dispose between them. Declaring the result inside the loop,
+  as the example does, avoids the question.
+- Do not edit a returned string in place: they are freed by recomputing their
+  length, so truncating one makes the later free wrong. Copy it first.
 - The API works at the allele level. A `flipped` result means REF and ALT were
   swapped and the caller must rewrite sample genotypes; that rewrite needs every
-  record at the position, which only the caller has. For the same reason the
-  one-flip-per-position rule is the caller's, through the `already_flipped`
-  argument.
+  record at the position, which only the caller has. `flipped` is meaningful only
+  when the status is OK -- a variant that flipped and then failed its reference
+  check reports `REF_MISMATCH` with `flipped == 0`.
+- `already_flipped` rejects a *second* flip at a position; it does not make every
+  call fail. A variant that needs no flip lifts normally whatever you pass.
 - Panics are caught at the boundary and returned as `LIFTOVER_INDELS_STATUS_ERROR`
-  rather than unwinding into foreign frames.
+  rather than unwinding into foreign frames, and a `NULL` engine or string argument
+  is reported the same way rather than crashing.
 
 `examples/cpp/liftover_example.cpp` is a worked client and doubles as the API's
 integration test: over 29,020 chr21 variants it reproduces the command line tool's

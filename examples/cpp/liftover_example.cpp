@@ -4,10 +4,11 @@
 // the lifted result for each. Used as the integration test for the C API: its
 // output is cross-checked against the command line tool's.
 //
-// Build (static, no runtime library path needed):
+// Build (static, no runtime library path needed). The archive carries htslib,
+// which needs the compression libraries:
 //   c++ -std=c++17 -O2 -I ../../include liftover_example.cpp
 //       ../../target/release/libliftover_indels.a -lpthread -ldl -lm
-//       -o liftover_example
+//       -lz -lbz2 -llzma -o liftover_example
 //
 // Run:
 //   ./liftover_example <chain> <ref_diffs.bcf> <target.fasta> [contig ...] < variants.tsv
@@ -31,12 +32,14 @@ struct EngineDeleter {
 using EnginePtr = std::unique_ptr<liftover_indels_engine, EngineDeleter>;
 
 // Owns the strings inside a result for exactly as long as the scope needs them.
+//
+// The constructor initialises the struct so the destructor can dispose it even if
+// the lift is never reached, and the destructor runs once per variant so results
+// are never reused without being freed. Those are the two ownership rules the
+// header sets out, expressed as RAII.
 class Result {
 public:
-    Result() { result_.status = LIFTOVER_INDELS_STATUS_ERROR; result_.message = nullptr;
-               result_.chrom = nullptr; result_.ref_allele = nullptr;
-               result_.alt_allele = nullptr; result_.pos = -1;
-               result_.flipped = 0; result_.realigned = 0; }
+    Result() { liftover_indels_result_init(&result_); }
     ~Result() { liftover_indels_result_dispose(&result_); }
     Result(const Result &) = delete;
     Result &operator=(const Result &) = delete;

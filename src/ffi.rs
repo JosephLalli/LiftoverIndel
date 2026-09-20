@@ -8,10 +8,14 @@
 //!   [`liftover_indels_close`].
 //! * [`liftover_indels_lift`] takes a `const` engine and does not mutate it, so a
 //!   single engine may be shared across threads and lifted from concurrently.
-//! * Every `char *` handed back — the strings inside a result, and the error string
-//!   from `open` — is owned by the caller. Release a result with
-//!   [`liftover_indels_result_dispose`] and an error string with
-//!   [`liftover_indels_string_free`].
+//! * A result's strings are released **only** by [`liftover_indels_result_dispose`],
+//!   which frees all of them at once. Never free an individual result field:
+//!   `dispose` would then free it a second time.
+//! * [`liftover_indels_string_free`] is for exactly one thing, the error string
+//!   [`liftover_indels_open`] writes on failure.
+//! * `dispose` frees whatever pointers the struct holds, so a result must be
+//!   initialised — by a call to [`liftover_indels_lift`] or
+//!   [`liftover_indels_result_init`] — before it is disposed.
 //!
 //! Panics are caught at the boundary and reported as
 //! `LIFTOVER_INDELS_STATUS_ERROR` rather than unwinding into foreign frames,
@@ -110,13 +114,18 @@ fn to_c_string(s: &str) -> *mut c_char {
     }
 }
 
+/// Borrow a required string argument, distinguishing a missing pointer from one
+/// whose bytes are not UTF-8 so the two get their own diagnostics.
+///
 /// # Safety
 /// `p` must be NULL or a valid NUL-terminated string.
-unsafe fn borrow_str<'a>(p: *const c_char) -> Option<&'a str> {
+unsafe fn require_str<'a>(p: *const c_char, what: &str) -> std::result::Result<&'a str, String> {
     if p.is_null() {
-        return None;
+        return Err(format!("{what} is required but was NULL"));
     }
-    CStr::from_ptr(p).to_str().ok()
+    CStr::from_ptr(p)
+        .to_str()
+        .map_err(|_| format!("{what} is not valid UTF-8"))
 }
 
 unsafe fn free_c_string(p: *mut c_char) {
@@ -141,6 +150,23 @@ pub unsafe extern "C" fn liftover_indels_options_init(opts: *mut liftover_indels
         return;
     }
     ptr::write(opts, liftover_indels_options::default());
+}
+
+/// Put a result into the initialised empty state.
+///
+/// [`liftover_indels_result_dispose`] frees whatever pointers the struct holds, so
+/// a result declared on the stack must be initialised before it can be disposed.
+/// Call this when a result may be disposed on a path where
+/// [`liftover_indels_lift`] was never reached.
+///
+/// # Safety
+/// `result` must be NULL or point to a writable `liftover_indels_result`.
+#[no_mangle]
+pub unsafe extern "C" fn liftover_indels_result_init(result: *mut liftover_indels_result) {
+    if result.is_null() {
+        return;
+    }
+    ptr::write(result, liftover_indels_result::empty());
 }
 
 /// Load a chain file, an assembly-differences VCF/BCF in *target* coordinates and
@@ -174,26 +200,18 @@ pub unsafe extern "C" fn liftover_indels_open(
         }
     };
 
-    let result = catch_unwind(AssertUnwindSafe(|| {
-        let (Some(chain), Some(diffs), Some(fasta)) = (
-            borrow_str(chain_path),
-            borrow_str(ref_diffs_path),
-            borrow_str(target_fasta_path),
-        ) else {
-            return Err("chain, ref-diffs and target FASTA paths are required".to_string());
-        };
+    let result = catch_unwind(AssertUnwindSafe(
+        || -> std::result::Result<Engine, String> {
+        let chain = require_str(chain_path, "chain path")?;
+        let diffs = require_str(ref_diffs_path, "ref-diffs path")?;
+        let fasta = require_str(target_fasta_path, "target FASTA path")?;
 
         let filter: Option<HashSet<String>> = if chroms.is_null() || n_chroms == 0 {
             None
         } else {
             let mut set = HashSet::with_capacity(n_chroms);
             for i in 0..n_chroms {
-                match borrow_str(*chroms.add(i)) {
-                    Some(name) => {
-                        set.insert(name.to_string());
-                    }
-                    None => return Err(format!("contig name {i} is not valid UTF-8")),
-                }
+                set.insert(require_str(*chroms.add(i), &format!("contig name {i}"))?.to_string());
             }
             Some(set)
         };
@@ -213,7 +231,8 @@ pub unsafe extern "C" fn liftover_indels_open(
         let threads = if o.threads > 0 { o.threads as usize } else { 1 };
 
         Engine::load(chain, diffs, fasta, filter.as_ref(), realign, threads)
-    }));
+    },
+    ));
 
     match result {
         Ok(Ok(inner)) => Box::into_raw(Box::new(liftover_indels_engine { inner })),
@@ -270,28 +289,42 @@ pub unsafe extern "C" fn liftover_indels_lift(
         return LIFTOVER_INDELS_STATUS_ERROR;
     }
 
-    let outcome = catch_unwind(AssertUnwindSafe(|| {
-        let (Some(c), Some(r), Some(a)) = (
-            borrow_str(chrom),
-            borrow_str(ref_allele),
-            borrow_str(alt_allele),
-        ) else {
-            return Err("chrom, ref and alt are required".to_string());
-        };
+    let outcome = catch_unwind(AssertUnwindSafe(
+        || -> std::result::Result<Outcome, String> {
+        let c = require_str(chrom, "chrom")?;
+        let r = require_str(ref_allele, "ref allele")?;
+        let a = require_str(alt_allele, "alt allele")?;
         Ok((*engine)
             .inner
             .lift(c, pos as i64, r, a, already_flipped != 0))
-    }));
+    },
+    ));
 
     match outcome {
         Ok(Ok(Outcome::Lifted(l))) => {
-            (*out).status = LIFTOVER_INDELS_STATUS_OK;
-            (*out).chrom = to_c_string(&l.chrom);
-            (*out).pos = l.start as c_longlong;
-            (*out).ref_allele = to_c_string(&l.ref_allele);
-            (*out).alt_allele = to_c_string(&l.alt_allele);
-            (*out).flipped = c_int::from(l.flipped);
-            (*out).realigned = c_int::from(l.realigned);
+            // A sequence carrying an interior NUL cannot be handed to C. Report
+            // that as an error rather than an OK result with NULL alleles, which
+            // would contradict the documented invariant and silently corrupt a
+            // caller that trusts it.
+            let chrom = to_c_string(&l.chrom);
+            let ref_allele = to_c_string(&l.ref_allele);
+            let alt_allele = to_c_string(&l.alt_allele);
+            if chrom.is_null() || ref_allele.is_null() || alt_allele.is_null() {
+                free_c_string(chrom);
+                free_c_string(ref_allele);
+                free_c_string(alt_allele);
+                (*out).status = LIFTOVER_INDELS_STATUS_ERROR;
+                (*out).message =
+                    to_c_string("lifted contig or allele contains an interior NUL byte");
+            } else {
+                (*out).status = LIFTOVER_INDELS_STATUS_OK;
+                (*out).chrom = chrom;
+                (*out).pos = l.start as c_longlong;
+                (*out).ref_allele = ref_allele;
+                (*out).alt_allele = alt_allele;
+                (*out).flipped = c_int::from(l.flipped);
+                (*out).realigned = c_int::from(l.realigned);
+            }
         }
         Ok(Ok(Outcome::Unliftable(m))) => {
             (*out).status = LIFTOVER_INDELS_STATUS_UNLIFTABLE;
@@ -348,7 +381,7 @@ mod tests {
 
     #[test]
     fn defaults_match_the_rust_configuration() {
-        let mut o = liftover_indels_options::default();
+        let o = liftover_indels_options::default();
         let d = RealignConfig::default();
         assert_eq!(o.realign_enabled, 1);
         assert_eq!(o.realign_distance, d.distance as c_longlong);
@@ -363,7 +396,7 @@ mod tests {
             threads: 9,
         };
         unsafe { liftover_indels_options_init(&mut z) };
-        o.threads = z.threads;
+        assert_eq!(z.threads, 2, "documented default for threads");
         assert_eq!(format!("{z:?}"), format!("{o:?}"));
     }
 
@@ -409,6 +442,58 @@ mod tests {
         unsafe { liftover_indels_string_free(err) };
         // closing NULL is a no-op
         unsafe { liftover_indels_close(ptr::null_mut()) };
+    }
+
+    // The header promises one engine may be lifted from concurrently. This is the
+    // check that would fail if anyone later gave Engine interior mutability.
+    #[test]
+    fn engine_is_shareable_across_threads() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<crate::engine::Engine>();
+        assert_send_sync::<liftover_indels_engine>();
+    }
+
+    #[test]
+    fn result_init_makes_a_stack_result_safe_to_dispose() {
+        let mut res = liftover_indels_result {
+            status: 12345,
+            chrom: 1 as *mut c_char,
+            pos: 99,
+            ref_allele: 2 as *mut c_char,
+            alt_allele: 3 as *mut c_char,
+            flipped: 7,
+            realigned: 7,
+            message: 4 as *mut c_char,
+        };
+        unsafe { liftover_indels_result_init(&mut res) };
+        assert!(res.chrom.is_null() && res.ref_allele.is_null());
+        assert!(res.alt_allele.is_null() && res.message.is_null());
+        assert_eq!(res.status, LIFTOVER_INDELS_STATUS_ERROR);
+        assert_eq!(res.pos, -1);
+        unsafe { liftover_indels_result_dispose(&mut res) };
+        unsafe { liftover_indels_result_dispose(&mut res) };
+        unsafe { liftover_indels_result_init(ptr::null_mut()) };
+    }
+
+    #[test]
+    fn a_null_argument_names_itself_rather_than_the_whole_set() {
+        let mut err: *mut c_char = ptr::null_mut();
+        let chain = CString::new("/nonexistent.chain").unwrap();
+        let e = unsafe {
+            liftover_indels_open(
+                chain.as_ptr(),
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                0,
+                ptr::null(),
+                &mut err,
+            )
+        };
+        assert!(e.is_null());
+        let msg = unsafe { CStr::from_ptr(err) }.to_str().unwrap().to_string();
+        assert!(msg.contains("ref-diffs path"), "unexpected message: {msg}");
+        unsafe { liftover_indels_string_free(err) };
     }
 
     #[test]

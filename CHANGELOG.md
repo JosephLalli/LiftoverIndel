@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+- Remove scratch build artifacts committed by mistake: a compiled binary, a
+  throwaway C file and a symlink to an absolute host path, none of which anything
+  referenced. Ignore `tmp_*/` so it cannot recur.
+- Add `liftover_indels_result_init`, so a result declared on the stack can be
+  safely disposed on a path that never reaches a lift. Disposing an uninitialised
+  result previously freed whatever the stack held.
+- Narrow `liftover_indels_string_free` to its one purpose, the error string from
+  `liftover_indels_open`. Using it on a field of a result and then disposing that
+  result was a use-after-free and a double free; the header now says so, and the
+  C++ example expresses the rule as RAII.
+- Report a lifted contig or allele carrying an interior NUL as an error rather
+  than returning status OK with NULL strings, which contradicted the documented
+  invariant and silently corrupted callers that trusted it.
+- Name the offending argument when `open` or `lift` is given a NULL or non-UTF-8
+  string, instead of blaming the whole set.
+- Correct the documented behaviour of `already_flipped`: it rejects a *second*
+  flip at a position, and does not make every call at that position fail. Also
+  document that `flipped` is meaningful only when the status is OK, that reusing a
+  result across lifts leaks unless it is disposed between them, that returned
+  strings must not be edited in place, that `n_chroms == 0` loads every contig,
+  that the `threads` default is 2 and a value below 1 is taken as 1, and that a
+  NULL engine or string argument is reported rather than fatal.
+- Drop `-lcurl` from the header's link line; the library is built without htslib's
+  remote-file support and never referenced it.
+- Assert `Engine: Send + Sync` in a test, so the header's promise that one engine
+  may be lifted from concurrently cannot regress unnoticed.
 - Expose a C ABI (`include/liftover_indels.h`) so C and C++ callers can lift
   variants directly. The library now builds as a static and a shared library
   alongside the Rust one, and `examples/cpp/liftover_example.cpp` is a worked

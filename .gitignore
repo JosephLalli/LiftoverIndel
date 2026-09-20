@@ -164,3 +164,6 @@ cython_debug/
 # Compiled C/C++ examples
 examples/cpp/liftover_example
 examples/cpp/abi_layout
+
+# Scratch directories from ad-hoc probes
+tmp_*/
