@@ -61,9 +61,78 @@ python3 liftover_indels.py \
 | `--realign-distance` | `50` | Max distance (bp) to search for nearby ref diffs during realignment |
 | `--realign-flank` | `20` | Flanking bases added to each side of the realignment window |
 | `--realign-max-window` | `200` | Maximum total realignment window size (bp) |
-| `--threads` | `2` | Threads for VCF/BCF reading via cyvcf2 |
+| `--threads` | `2` | Threads for VCF/BCF reading |
 | `--debug` | off | Enable verbose debug logging to stderr |
 | `--quiet` | off | Suppress progress bars |
+
+### Rust implementation
+
+`liftover_indels.py` is also implemented in Rust, in `src/`. It takes the same flags,
+reads and writes the same files, and is the faster of the two; the Python script
+remains in the tree and is the reference the Rust is checked against.
+
+#### Building
+
+```
+cargo build --release
+```
+
+The binary is written to `target/release/liftover_indels`.
+
+The `rust-htslib` dependency builds htslib through `bindgen`, which needs a working
+`libclang`. Where the system `libclang` is broken or missing, point the build at
+another LLVM installation, for example:
+
+```
+export LIBCLANG_PATH=/path/to/llvm/lib
+export BINDGEN_EXTRA_CLANG_ARGS="-I$(/path/to/llvm/bin/clang -print-resource-dir)/include"
+cargo build --release
+```
+
+#### Running
+
+```
+target/release/liftover_indels \
+    --input-vcf vcf_to_lift.bcf \
+    --ref-diffs-vcf vcf_of_assembly_differences.bcf \
+    --output-vcf lifted_over_output.bcf \
+    --chain chainfile.chain \
+    --target-fasta target_fasta.fasta \
+    [options]
+```
+
+#### Agreement with the Python
+
+Both were run over chr21 of a 107-sample HPRC/HGSVC callset, 619,323 biallelic
+variants, lifted from CHM13v2 to GRCh38. The three sidecar files are identical
+record for record (37,500 unliftable, 714 multiple-overlap, 32,601 ref-seq
+mismatch). The main output agrees on 548,503 of 548,508 records, the five that differ
+landing at three positions. The per-decision `--debug` traces agree on 682,997 of the
+683,006 lines the Python emits; nine Python lines have no counterpart and the Rust
+emits seven the Python does not, all of them realignment decisions. With `--no-realign`
+the two agree completely.
+
+The five differing records all come from one place. When haplotype realignment looks
+for the nearest assembly difference, two differences can be exactly the same distance
+from the variant, and `min()` in Python then returns whichever the interval tree's
+result set happens to iterate first. Across chr21 this happens for 46 of 23,066
+realignment queries, and Python takes the earlier difference in 25 and the later one
+in 21, so the choice is not a rule that can be reimplemented. The Rust always takes
+the earliest difference by `(start, end)`, which is at least reproducible across
+machines. Adding `indels.sort(key=lambda d: (d.start, d.end))` before the `min()` call
+in `attempt_haplotype_realignment` would make the Python deterministic and bring the
+two into exact agreement.
+
+Two further differences, neither affecting output records:
+
+- The Rust does not make the extra counting pass over the input that the Python makes
+  to size its progress bars, so progress is reported without a known total.
+- For a record with no ALT allele, the Python logs two stderr lines (a summary and the
+  full record) before dropping it; the Rust logs only the summary line.
+
+Where the Python would raise an uncaught exception the Rust exits with a message
+instead: a target contig missing from the assembly-differences VCF, and an
+assembly-difference record with no ALT allele.
 
 ### Output Files
 

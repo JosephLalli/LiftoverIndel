@@ -2,7 +2,6 @@
 name = "liftover_indels"
 version = "1.0.1"
 edition = "2021"
-rust-version = "1.74"
 description = "Liftover variants between genome references in an indel-aware manner"
 license = "GPL-3.0-only"
 repository = "https://github.com/JosephLalli/LiftoverIndel"

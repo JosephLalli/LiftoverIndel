@@ -52,13 +52,17 @@ impl Ctx {
     }
 }
 
-/// A sample's genotype as the Python sees it: the first two alleles (`-1` when
-/// missing) plus whether the genotype is phased.
+/// A sample's genotype exactly as cyvcf2's `genotype.array()` row presents it:
+/// the first two allele slots plus the phase flag.
+///
+/// Missing alleles are `-1`; a haploid sample's second slot is `-2`, htslib's
+/// vector-end marker. Both are non-zero, which is what the flip rule keys on, but
+/// they are kept distinct because the rule sums slots across every record at the
+/// site and the two values are not interchangeable in that sum.
 #[derive(Clone, Copy)]
 struct SampleGt {
     a: [i16; 2],
     phased: bool,
-    ploidy: usize,
 }
 
 fn read_genotypes(rec: &Record, n_samples: usize) -> Vec<SampleGt> {
@@ -67,7 +71,9 @@ fn read_genotypes(rec: &Record, n_samples: usize) -> Vec<SampleGt> {
         Ok(gts) => {
             for s in 0..n_samples {
                 let g = gts.get(s);
-                let mut a = [-1i16; 2];
+                // Slots past the sample's ploidy hold htslib's vector-end marker,
+                // which cyvcf2 surfaces as -2.
+                let mut a = [-2i16; 2];
                 for (i, slot) in a.iter_mut().enumerate() {
                     if let Some(allele) = g.get(i) {
                         *slot = match allele.index() {
@@ -76,16 +82,14 @@ fn read_genotypes(rec: &Record, n_samples: usize) -> Vec<SampleGt> {
                         };
                     }
                 }
-                // cyvcf2 reports a genotype as phased from the second allele's bit.
-                let phased = match g.get(1).or_else(|| g.first()) {
+                // cyvcf2 takes the phase from the second allele's bit, and reports
+                // a haploid genotype as phased.
+                let phased = match g.get(1) {
                     Some(GenotypeAllele::Phased(_)) | Some(GenotypeAllele::PhasedMissing) => true,
-                    _ => false,
+                    Some(_) => false,
+                    None => true,
                 };
-                out.push(SampleGt {
-                    a,
-                    phased,
-                    ploidy: g.len(),
-                });
+                out.push(SampleGt { a, phased });
             }
         }
         Err(_) => {
@@ -93,7 +97,6 @@ fn read_genotypes(rec: &Record, n_samples: usize) -> Vec<SampleGt> {
                 out.push(SampleGt {
                     a: [-1, -1],
                     phased: false,
-                    ploidy: 2,
                 });
             }
         }
@@ -120,8 +123,10 @@ fn flip_genotypes(group: &[Vec<SampleGt>], idx: usize) -> Vec<GenotypeAllele> {
                 sum[k] = sum[k].wrapping_add(other[s].a[k]);
             }
         }
-        let n = gt.ploidy.min(2).max(1);
-        for slot in sum.iter().take(n) {
+        // Every sample is written with two alleles, because the Python assigns the
+        // whole (samples x 2) array back. A haploid sample therefore comes out of a
+        // flip as a diploid homozygote.
+        for slot in sum.iter() {
             let allele = i32::from(*slot == 0);
             out.push(if gt.phased {
                 GenotypeAllele::Phased(allele)
@@ -332,15 +337,19 @@ fn load_ref_diffs(
             }
         }
         let alleles = record.alleles();
-        if alleles.is_empty() {
-            continue;
-        }
-        let ref_allele = String::from_utf8_lossy(alleles[0]).into_owned();
-        let alt_allele = alleles
-            .get(1)
-            .map(|a| String::from_utf8_lossy(a).into_owned())
-            .unwrap_or_default();
         let start = record.pos();
+        // Every assembly difference must have an ALT: the liftover rules read it
+        // unconditionally. The Python raises an uncaught IndexError if one is ever
+        // used, so reject it up front rather than carry an empty allele silently.
+        let (Some(r), Some(a)) = (alleles.first(), alleles.get(1)) else {
+            return Err(format!(
+                "{path}: record at {chrom}:{} has no ALT allele; the assembly-differences \
+                 VCF must give both alleles of every difference",
+                start + 1
+            ));
+        };
+        let ref_allele = String::from_utf8_lossy(r).into_owned();
+        let alt_allele = String::from_utf8_lossy(a).into_owned();
         per_contig.entry(chrom).or_default().push(RefDiff {
             start,
             end: start + i64::from(record.rlen() as i32),
@@ -516,7 +525,7 @@ fn run(args: Args) -> Result<(), String> {
 
         for (i, lifted_start, lifted_end) in &lifted {
             let i = *i;
-            let state = states[i].as_mut_slice_hack();
+            let state = states[i].as_mut().expect("lifted record has state");
             let chrom = lifted_start.0.clone();
             let span_start = lifted_start.1.min(lifted_end.1);
             let span_end = lifted_start.1.max(lifted_end.1);
@@ -915,14 +924,110 @@ impl<'a> PositionGroups<'a> {
     }
 }
 
-/// Small helper so a `&mut Option<VarState>` can be used where the state is known
-/// to be present.
-trait OptionStateExt {
-    fn as_mut_slice_hack(&mut self) -> &mut VarState;
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-impl OptionStateExt for Option<VarState> {
-    fn as_mut_slice_hack(&mut self) -> &mut VarState {
-        self.as_mut().expect("lifted record must have state")
+    fn gt(a0: i16, a1: i16, phased: bool) -> SampleGt {
+        SampleGt {
+            a: [a0, a1],
+            phased,
+        }
+    }
+
+    fn alleles(v: &[GenotypeAllele]) -> Vec<(i32, bool)> {
+        v.iter()
+            .map(|g| match g {
+                GenotypeAllele::Phased(i) => (*i, true),
+                GenotypeAllele::Unphased(i) => (*i, false),
+                GenotypeAllele::PhasedMissing => (-1, true),
+                GenotypeAllele::UnphasedMissing => (-1, false),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn flip_turns_reference_alleles_into_alternates() {
+        // One record at the site: 0|1 becomes 1|0.
+        let group = vec![vec![gt(0, 1, true)]];
+        assert_eq!(alleles(&flip_genotypes(&group, 0)), vec![(1, true), (0, true)]);
+    }
+
+    #[test]
+    fn flip_preserves_the_phase_flag() {
+        let group = vec![vec![gt(0, 1, false)]];
+        assert_eq!(
+            alleles(&flip_genotypes(&group, 0)),
+            vec![(1, false), (0, false)]
+        );
+    }
+
+    // Missing is -1, not 0, so it does not survive the flip as missing.
+    #[test]
+    fn a_half_missing_genotype_collapses_to_homozygous_reference() {
+        let group = vec![vec![gt(1, -1, true)]];
+        assert_eq!(alleles(&flip_genotypes(&group, 0)), vec![(0, true), (0, true)]);
+    }
+
+    #[test]
+    fn a_fully_missing_genotype_collapses_to_homozygous_reference() {
+        let group = vec![vec![gt(-1, -1, false)]];
+        assert_eq!(
+            alleles(&flip_genotypes(&group, 0)),
+            vec![(0, false), (0, false)]
+        );
+    }
+
+    // A haploid sample carries the vector-end marker in its second slot and is
+    // written back as a diploid homozygote.
+    #[test]
+    fn a_haploid_genotype_becomes_a_diploid_homozygote() {
+        let group = vec![vec![gt(1, -2, true)]];
+        assert_eq!(alleles(&flip_genotypes(&group, 0)), vec![(0, true), (0, true)]);
+    }
+
+    // The rule sums across every record at the site: an allele becomes the new
+    // ALT only if the sample is reference for all of them.
+    #[test]
+    fn flip_accounts_for_other_records_at_the_same_position() {
+        // Sample is 0|0 here but 0|1 at the other record, so slot 1 is not free.
+        let group = vec![vec![gt(0, 0, true)], vec![gt(0, 1, true)]];
+        assert_eq!(alleles(&flip_genotypes(&group, 0)), vec![(1, true), (0, true)]);
+    }
+
+    #[test]
+    fn output_spec_follows_the_extension() {
+        assert_eq!(output_spec("a.bcf"), ("a.bcf".to_string(), false, Format::Bcf));
+        assert_eq!(
+            output_spec("a.vcf.gz"),
+            ("a.vcf.gz".to_string(), false, Format::Vcf)
+        );
+        assert_eq!(output_spec("a.vcf"), ("a.vcf".to_string(), true, Format::Vcf));
+        assert_eq!(output_spec("-"), ("-".to_string(), true, Format::Bcf));
+        assert_eq!(
+            output_spec("/dev/stdout"),
+            ("-".to_string(), true, Format::Bcf)
+        );
+    }
+
+    #[test]
+    fn sidecar_base_drops_the_last_extension() {
+        assert_eq!(sidecar_base("out.bcf"), "out");
+        assert_eq!(sidecar_base("out.vcf.gz"), "out");
+        assert_eq!(sidecar_base("a.b.bcf"), "a.b");
+        // Stdout leaves an empty base, so the sidecars become dotfiles.
+        assert_eq!(sidecar_base("-"), "");
+    }
+
+    #[test]
+    fn is_snp_requires_a_single_unambiguous_alt_base() {
+        assert!(is_snp("A", "G"));
+        // The reference base is not checked, matching cyvcf2.
+        assert!(is_snp("N", "G"));
+        assert!(!is_snp("A", "GT"));
+        assert!(!is_snp("AT", "G"));
+        assert!(!is_snp("A", "N"));
+        assert!(!is_snp("A", "*"));
+        assert!(!is_snp("A", "g"));
     }
 }
