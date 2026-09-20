@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- Expose a C ABI (`include/liftover_indels.h`) so C and C++ callers can lift
+  variants directly. The library now builds as a static and a shared library
+  alongside the Rust one, and `examples/cpp/liftover_example.cpp` is a worked
+  client. Over 29,020 chr21 variants the C API reproduces the command line tool's
+  partition and values exactly, and valgrind reports every heap block freed.
+- Move the per-variant liftover into `src/engine.rs`, leaving the binary with
+  record I/O, position grouping and genotype rewriting. Full-chromosome output is
+  unchanged by the move, byte for byte.
+- Measured against the Python on chr21 (619,323 variants, 107 samples): 82.9 s and
+  841 MB for the Python against 9.9 s and 134 MB for the Rust. Excluding the fixed
+  load, the marginal cost per variant is 118 us for the Python, 15.5 us through the
+  Rust command line, and 5.6 us through the C API.
+
 - Add a Rust implementation of the liftover in `src/`, built with `cargo build --release`.
   It takes the same flags as `liftover_indels.py` and writes the same main output and
   sidecar files. The Python script stays in the tree as the reference implementation.

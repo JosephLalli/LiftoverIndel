@@ -67,9 +67,11 @@ python3 liftover_indels.py \
 
 ### Rust implementation
 
-`liftover_indels.py` is also implemented in Rust, in `src/`. It takes the same flags,
-reads and writes the same files, and is the faster of the two; the Python script
-remains in the tree and is the reference the Rust is checked against.
+`liftover_indels.py` is also implemented in Rust, in `src/`. It takes the same flags
+and reads and writes the same files; the Python script remains in the tree and is
+the reference the Rust is checked against. See [Performance](#performance) for
+measured timings and [C and C++ API](#c-and-c-api) for using it from other
+languages.
 
 #### Building
 
@@ -134,6 +136,103 @@ Two further differences, neither affecting output records:
 Where the Python would raise an uncaught exception the Rust exits with a message
 instead: a target contig missing from the assembly-differences VCF, and an
 assembly-difference record with no ALT allele.
+
+#### Performance
+
+Measured on chr21 of the 107-sample callset, CHM13v2 to GRCh38, with identical
+inputs and flags. The host is a shared 2x AMD EPYC 7713 with other work running
+(load average around 65), so each condition was repeated and the median is given
+with the observed spread. Both implementations default to `--threads 2`.
+
+| Workload | Python | Rust | Speedup | Python peak RSS | Rust peak RSS |
+|---|---|---|---|---|---|
+| Load only (1 variant) | 9.83 s | 0.24 s | 41x | 663 MB | 82 MB |
+| 29,020 variants | 15.63 s | 1.07 s | 15x | 668 MB | 84 MB |
+| 619,323 variants | 82.91 s | 9.85 s | 8.4x | 841 MB | 134 MB |
+| 619,323, `--no-realign` | 46.27 s | 7.58 s | 6.1x | 835 MB | 136 MB |
+
+Spread over repetitions: Python 80.9-88.7 s and Rust 8.5-11.3 s on the full
+chromosome (n=3); Python 9.3-14.4 s and Rust 0.24-0.26 s on load only (n=5).
+
+The end-to-end ratio understates the difference on small jobs and overstates it on
+large ones, because a fixed cost of loading the chain, the assembly differences and
+the target reference sits in front of every run. Subtracting the load-only time
+leaves the marginal cost of lifting one variant:
+
+| | Load | Per variant | Throughput |
+|---|---|---|---|
+| Python | 9.83 s | 118 us | 8,500 variants/s |
+| Rust, command line | 0.24 s | 15.5 us | 64,000 variants/s |
+| Rust, C API | 0.25 s | 5.6 us | 177,000 variants/s |
+
+The C API is faster than the command line tool because it does no VCF work: it
+neither parses records nor decodes and rewrites genotypes for 107 samples, which is
+most of the command line tool's remaining 10 us.
+
+Haplotype realignment is the most expensive stage and the two implementations pay
+very differently for it. It adds 59 us per variant to the Python, roughly doubling
+its per-variant cost, against 3.7 us to the Rust, about a third more.
+
+### C and C++ API
+
+The library exposes a C ABI, so C and C++ callers can lift variants without going
+through a VCF. The header is `include/liftover_indels.h` and is safe to include
+from C++.
+
+`cargo build --release` produces `target/release/libliftover_indels.a` and
+`libliftover_indels.so` alongside the binary.
+
+```c++
+#include "liftover_indels.h"
+
+liftover_indels_options opts;
+liftover_indels_options_init(&opts);
+
+char *error = nullptr;
+const char *contigs[] = {"chr21"};
+liftover_indels_engine *engine = liftover_indels_open(
+    "chm13v2-grch38.chain", "grch38-chm13v2.sort.bcf", "GRCh38.fasta",
+    contigs, 1, &opts, &error);
+if (!engine) { /* report error, then liftover_indels_string_free(error) */ }
+
+liftover_indels_result r;
+if (liftover_indels_lift(engine, "chr21", pos0, "AAAT", "A", 0, &r)
+        == LIFTOVER_INDELS_STATUS_OK) {
+    // r.chrom, r.pos (0-based), r.ref_allele, r.alt_allele, r.flipped, r.realigned
+}
+liftover_indels_result_dispose(&r);
+liftover_indels_close(engine);
+```
+
+Linking statically:
+
+```
+c++ -std=c++17 -O2 -I include app.cpp \
+    target/release/libliftover_indels.a -lpthread -ldl -lm -lz -lbz2 -llzma \
+    -o app
+```
+
+Notes:
+
+- Loading dominates the cost of a lift, so build one engine and reuse it. Naming
+  only the contigs you need keeps the rest of the target reference out of memory.
+- `liftover_indels_lift` takes a `const` engine and does not mutate it, so one
+  engine can be shared by several threads lifting concurrently.
+- Every `char *` returned is owned by the caller. Release a result with
+  `liftover_indels_result_dispose` and the error string with
+  `liftover_indels_string_free`.
+- The API works at the allele level. A `flipped` result means REF and ALT were
+  swapped and the caller must rewrite sample genotypes; that rewrite needs every
+  record at the position, which only the caller has. For the same reason the
+  one-flip-per-position rule is the caller's, through the `already_flipped`
+  argument.
+- Panics are caught at the boundary and returned as `LIFTOVER_INDELS_STATUS_ERROR`
+  rather than unwinding into foreign frames.
+
+`examples/cpp/liftover_example.cpp` is a worked client and doubles as the API's
+integration test: over 29,020 chr21 variants it reproduces the command line tool's
+partition and values exactly (25,550 lifted, 1,753 unliftable, 1,665 reference
+mismatches, 52 multiple-overlap), and valgrind reports every heap block freed.
 
 ### Output Files
 
