@@ -12,9 +12,9 @@
   `--no-realign` the two agree completely.
 - The remaining five records come from `attempt_haplotype_realignment` choosing between
   two assembly differences that are equally distant from the variant. Python's `min()`
-  resolves the tie by interval-tree set iteration order, which picked the earlier
-  difference in 25 of 46 tied chr21 queries and the later one in 21; the Rust always
-  takes the earliest by `(start, end)`. Sorting the candidates before the `min()` call
+  resolves the tie by interval-tree set iteration order: of the 13,307 chr21 queries
+  that reach the choice, 45 are tied, and Python picked the earlier difference in 29
+  and the later one in 16; the Rust always takes the earliest by `(start, end)`. Sorting the candidates before the `min()` call
   in the Python would make both deterministic and identical.
 
 ## v1.0.1

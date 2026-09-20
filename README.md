@@ -115,13 +115,14 @@ the two agree completely.
 The five differing records all come from one place. When haplotype realignment looks
 for the nearest assembly difference, two differences can be exactly the same distance
 from the variant, and `min()` in Python then returns whichever the interval tree's
-result set happens to iterate first. Across chr21 this happens for 46 of 23,066
-realignment queries, and Python takes the earlier difference in 25 and the later one
-in 21, so the choice is not a rule that can be reimplemented. The Rust always takes
+result set happens to iterate first. Across chr21, 13,307 queries reach that choice
+and 45 of them are tied; Python takes the earlier difference in 29 and the later one
+in 16, so the choice is not a rule that can be reimplemented. The Rust always takes
 the earliest difference by `(start, end)`, which is at least reproducible across
-machines. Adding `indels.sort(key=lambda d: (d.start, d.end))` before the `min()` call
-in `attempt_haplotype_realignment` would make the Python deterministic and bring the
-two into exact agreement.
+machines; it therefore agrees on 29 of the 45, and only three of the remaining
+sixteen change a written record. Adding `indels.sort(key=lambda d: (d.start, d.end))`
+before the `min()` call in `attempt_haplotype_realignment` would make the Python
+deterministic and bring the two into exact agreement.
 
 Two further differences, neither affecting output records:
 
