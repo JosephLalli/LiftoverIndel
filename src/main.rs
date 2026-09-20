@@ -9,14 +9,15 @@ use rust_htslib::bcf::header::Header;
 use rust_htslib::bcf::record::GenotypeAllele;
 use rust_htslib::bcf::{Format, Read, Reader, Record, Writer};
 
-use liftover_indels::adjust::compute_adjusted_ref_alt;
-use liftover_indels::alleles::{rev_comp, trim_identical_suffix};
 use liftover_indels::chain::LiftOver;
 use liftover_indels::cli::Args;
+use liftover_indels::engine::{
+    load_ref_diffs, perform_clean_liftover, resolve_with_overlap, resolve_without_overlap,
+    Resolution, VarState,
+};
 use liftover_indels::error::VariantError;
 use liftover_indels::fasta::{load_target_genome, Genome};
-use liftover_indels::realign::{attempt_haplotype_realignment, RealignConfig};
-use liftover_indels::refdiff::{RefDiff, RefDiffIndex};
+use liftover_indels::realign::RealignConfig;
 
 /// INFO definitions added to the output header, in the order the Python adds them.
 const INFO_LINES: &[&str] = &[
@@ -138,97 +139,6 @@ fn flip_genotypes(group: &[Vec<SampleGt>], idx: usize) -> Vec<GenotypeAllele> {
     out
 }
 
-/// `seq[a:b]` with Python's clamping.
-fn pslice(seq: &[u8], a: usize, b: usize) -> &[u8] {
-    let len = seq.len();
-    let a = a.min(len);
-    let b = b.min(len).max(a);
-    &seq[a..b]
-}
-
-fn is_snp(r: &str, a: &str) -> bool {
-    r.len() == 1 && matches!(a, "A" | "C" | "G" | "T")
-}
-
-/// The alleles and coordinates of a record as the liftover works on them.
-struct VarState {
-    chrom: String,
-    start: i64,
-    ref_allele: String,
-    alt_allele: String,
-}
-
-impl VarState {
-    fn end(&self) -> i64 {
-        self.start + self.ref_allele.len() as i64
-    }
-}
-
-/// Verify a lifted allele against the target reference.
-fn check_var_ref(v: &VarState, genome: &Genome) -> Result<(), VariantError> {
-    let Some(seq) = genome.get(&v.chrom) else {
-        return Err(VariantError::Mismatch("contig absent from target reference"));
-    };
-    let target_ref = pslice(seq, v.start.max(0) as usize, v.end().max(0) as usize);
-    if target_ref.iter().any(|b| !matches!(b, b'A' | b'C' | b'G' | b'T')) {
-        return Err(VariantError::Unliftable(
-            "degenerate base in target reference",
-        ));
-    }
-    if v.ref_allele.as_bytes() == target_ref {
-        Ok(())
-    } else {
-        Err(VariantError::Mismatch("lifted REF does not match target"))
-    }
-}
-
-/// Coordinate liftover plus reverse-strand allele handling.
-///
-/// Returns the target coordinates of the variant's start and end, or `None` when
-/// either endpoint fails to map uniquely. `v` is updated in place.
-fn perform_clean_liftover(
-    v: &mut VarState,
-    lo: &LiftOver,
-    genome: &Genome,
-) -> Option<((String, i64), (String, i64))> {
-    let (r, a) = trim_identical_suffix(&v.ref_allele, &v.alt_allele);
-    v.ref_allele = r;
-    v.alt_allele = a;
-
-    let start_hits = lo.convert_coordinate(&v.chrom, v.start)?;
-    let end_hits = lo.convert_coordinate(&v.chrom, v.end())?;
-    if start_hits.len() != 1 || end_hits.len() != 1 {
-        return None;
-    }
-    let mut new_start = (
-        start_hits[0].chrom.clone(),
-        start_hits[0].pos,
-        start_hits[0].strand,
-    );
-    let mut new_end = (end_hits[0].chrom.clone(), end_hits[0].pos, end_hits[0].strand);
-
-    if new_start.2 == '-' {
-        std::mem::swap(&mut new_start, &mut new_end);
-        if !is_snp(&v.ref_allele, &v.alt_allele) {
-            // The anchor base is read from the target; the rest is complemented.
-            let seq = genome.get(&new_start.0)?;
-            let idx = usize::try_from(new_start.1).ok()?;
-            let base = *seq.get(idx)? as char;
-            v.ref_allele = format!("{base}{}", rev_comp(&v.ref_allele[1..]));
-            v.alt_allele = format!("{base}{}", rev_comp(&v.alt_allele[1..]));
-        } else {
-            new_start.1 += 1;
-            new_end = (new_start.0.clone(), new_end.1 + 1, new_end.2);
-            v.ref_allele = rev_comp(&v.ref_allele);
-            v.alt_allele = rev_comp(&v.alt_allele);
-        }
-    }
-
-    v.chrom = new_start.0.clone();
-    v.start = new_start.1;
-    Some(((new_start.0, new_start.1), (new_end.0, new_end.1)))
-}
-
 /// Buckets of records that failed to lift, keyed by source position so the
 /// emission order matches the Python's insertion-ordered dict.
 #[derive(Default)]
@@ -292,85 +202,6 @@ fn sidecar_base(out_vcf: &str) -> String {
     parts[..parts.len().saturating_sub(1)].join(".")
 }
 
-fn load_ref_diffs(
-    path: &str,
-    chrom_filter: Option<&HashSet<String>>,
-    threads: usize,
-    quiet: bool,
-) -> Result<RefDiffIndex, String> {
-    let mut reader =
-        Reader::from_path(path).map_err(|e| format!("could not open {path}: {e}"))?;
-    if threads > 1 {
-        let _ = reader.set_threads(threads);
-    }
-    let header = reader.header().clone();
-
-    let mut per_contig: HashMap<String, Vec<RefDiff>> = HashMap::new();
-    // Contigs declared in the header start empty, as the Python pre-seeds them.
-    for rid in 0..header.contig_count() {
-        if let Ok(name) = header.rid2name(rid) {
-            let name = String::from_utf8_lossy(name).into_owned();
-            if chrom_filter.map_or(true, |f| f.contains(&name)) {
-                per_contig.entry(name).or_default();
-            }
-        }
-    }
-
-    let spinner = progress_spinner(quiet, "Loading variation between builds");
-    let mut record = reader.empty_record();
-    let mut n: u64 = 0;
-    while let Some(res) = reader.read(&mut record) {
-        res.map_err(|e| format!("error reading {path}: {e}"))?;
-        let rid = match record.rid() {
-            Some(r) => r,
-            None => continue,
-        };
-        let chrom = String::from_utf8_lossy(
-            header
-                .rid2name(rid)
-                .map_err(|e| format!("bad contig id in {path}: {e}"))?,
-        )
-        .into_owned();
-        if let Some(f) = chrom_filter {
-            if !f.contains(&chrom) {
-                continue;
-            }
-        }
-        let alleles = record.alleles();
-        let start = record.pos();
-        // Every assembly difference must have an ALT: the liftover rules read it
-        // unconditionally. The Python raises an uncaught IndexError if one is ever
-        // used, so reject it up front rather than carry an empty allele silently.
-        let (Some(r), Some(a)) = (alleles.first(), alleles.get(1)) else {
-            return Err(format!(
-                "{path}: record at {chrom}:{} has no ALT allele; the assembly-differences \
-                 VCF must give both alleles of every difference",
-                start + 1
-            ));
-        };
-        let ref_allele = String::from_utf8_lossy(r).into_owned();
-        let alt_allele = String::from_utf8_lossy(a).into_owned();
-        per_contig.entry(chrom).or_default().push(RefDiff {
-            start,
-            end: start + i64::from(record.rlen() as i32),
-            ref_allele,
-            alt_allele,
-        });
-        n += 1;
-        if n % 100_000 == 0 {
-            if let Some(s) = &spinner {
-                s.set_message(format!("Loading variation between builds ({n} records)"));
-                s.tick();
-            }
-        }
-    }
-    if let Some(s) = spinner {
-        s.finish_and_clear();
-    }
-    eprintln!("Organizing vcf containing variation between builds...");
-    Ok(RefDiffIndex::build(per_contig))
-}
-
 fn progress_spinner(quiet: bool, msg: &str) -> Option<ProgressBar> {
     if quiet {
         return None;
@@ -407,7 +238,7 @@ fn run(args: Args) -> Result<(), String> {
         &args.ref_diffs_vcf,
         chrom_filter.as_ref(),
         args.threads,
-        args.quiet,
+        true,
     )?;
 
     let ctx = Ctx {
@@ -566,7 +397,8 @@ fn run(args: Args) -> Result<(), String> {
                     span_start,
                     span_end,
                     &ref_diffs,
-                    &ctx,
+                    &ctx.genome,
+                    &ctx.realign,
                     already_flipped,
                 )
             } else {
@@ -575,7 +407,7 @@ fn run(args: Args) -> Result<(), String> {
                     overlap[0],
                     lifted_start.1,
                     lifted_end.1,
-                    &ctx,
+                    &ctx.genome,
                     already_flipped,
                 )
             };
@@ -696,97 +528,6 @@ fn run(args: Args) -> Result<(), String> {
     eprintln!("\nDone!");
     eprintln!("Note: lifted vcf file still requires indel normalizing, sorting, and recalculation of INFO fields. Format fields besides GT are no longer reliable.");
     Ok(())
-}
-
-struct Resolution {
-    flip: bool,
-    realigned: bool,
-}
-
-/// A site may only flip once. The Python raises `AssertionError` here, which its
-/// handler catches alongside `ValueError`, so a second flip is diverted to the
-/// ref-mismatch sidecar rather than aborting the run. The check happens before
-/// the reference is validated, so it takes precedence over a reference failure.
-fn guard_single_flip(already_flipped: bool) -> Result<(), VariantError> {
-    if already_flipped {
-        Err(VariantError::Mismatch("double flip at site"))
-    } else {
-        Ok(())
-    }
-}
-
-fn resolve_without_overlap(
-    state: &mut VarState,
-    chrom: &str,
-    span_start: i64,
-    span_end: i64,
-    ref_diffs: &RefDiffIndex,
-    ctx: &Ctx,
-    already_flipped: bool,
-) -> Result<Resolution, VariantError> {
-    let mut flip = false;
-    let mut realigned = false;
-    let attempt = attempt_haplotype_realignment(
-        &state.ref_allele,
-        &state.alt_allele,
-        chrom,
-        span_start,
-        span_end,
-        ref_diffs,
-        &ctx.genome,
-        &ctx.realign,
-    )?;
-    if let Some((pos, r, a)) = attempt {
-        state.start = pos;
-        if r == a {
-            guard_single_flip(already_flipped)?;
-            flip = true;
-            std::mem::swap(&mut state.ref_allele, &mut state.alt_allele);
-        } else {
-            state.ref_allele = r;
-            state.alt_allele = a;
-        }
-        realigned = true;
-    }
-    check_var_ref(state, &ctx.genome)?;
-    Ok(Resolution { flip, realigned })
-}
-
-fn resolve_with_overlap(
-    state: &mut VarState,
-    diff: &RefDiff,
-    lifted_start: i64,
-    lifted_end: i64,
-    ctx: &Ctx,
-    already_flipped: bool,
-) -> Result<Resolution, VariantError> {
-    let (new_ref, new_alt) = compute_adjusted_ref_alt(
-        &state.ref_allele,
-        &state.alt_allele,
-        diff,
-        lifted_start,
-        lifted_end,
-    )?;
-    let mut flip = false;
-    if new_ref == new_alt {
-        guard_single_flip(already_flipped)?;
-        flip = true;
-        std::mem::swap(&mut state.ref_allele, &mut state.alt_allele);
-    } else {
-        state.ref_allele = new_ref;
-        state.alt_allele = new_alt;
-    }
-    // The Python asserts this before checking the reference.
-    if state.ref_allele.len() != state.alt_allele.len()
-        && state.ref_allele.as_bytes().first() != state.alt_allele.as_bytes().first()
-    {
-        return Err(VariantError::Mismatch("anchor base disagrees after adjust"));
-    }
-    check_var_ref(state, &ctx.genome)?;
-    Ok(Resolution {
-        flip,
-        realigned: false,
-    })
 }
 
 fn contig_name(header: &rust_htslib::bcf::header::HeaderView, rec: &Record) -> Result<String, String> {
@@ -1017,17 +758,5 @@ mod tests {
         assert_eq!(sidecar_base("a.b.bcf"), "a.b");
         // Stdout leaves an empty base, so the sidecars become dotfiles.
         assert_eq!(sidecar_base("-"), "");
-    }
-
-    #[test]
-    fn is_snp_requires_a_single_unambiguous_alt_base() {
-        assert!(is_snp("A", "G"));
-        // The reference base is not checked, matching cyvcf2.
-        assert!(is_snp("N", "G"));
-        assert!(!is_snp("A", "GT"));
-        assert!(!is_snp("AT", "G"));
-        assert!(!is_snp("A", "N"));
-        assert!(!is_snp("A", "*"));
-        assert!(!is_snp("A", "g"));
     }
 }

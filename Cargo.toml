@@ -14,6 +14,8 @@ path = "src/main.rs"
 [lib]
 name = "liftover_indels"
 path = "src/lib.rs"
+# rlib for the binary and Rust consumers; staticlib and cdylib for the C API.
+crate-type = ["rlib", "staticlib", "cdylib"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
