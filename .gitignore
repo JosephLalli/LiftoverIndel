@@ -163,3 +163,4 @@ cython_debug/
 
 # Compiled C/C++ examples
 examples/cpp/liftover_example
+examples/cpp/abi_layout
