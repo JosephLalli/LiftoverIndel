@@ -167,3 +167,7 @@ examples/cpp/abi_layout
 
 # Scratch directories from ad-hoc probes
 tmp_*/
+
+# Python bytecode
+__pycache__/
+*.pyc

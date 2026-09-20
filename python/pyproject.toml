@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "liftover-indels"
+version = "1.0.1"
+description = "Indel-aware liftover of variants between genome references"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "GPL-3.0-only" }
+authors = [{ name = "Joseph Lalli" }]
+
+# No runtime dependencies: the binding uses ctypes from the standard library and
+# loads libliftover_indels.so, which is built by cargo. See the package docstring
+# for where it is searched for, and LIFTOVER_INDELS_LIB to override.
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/JosephLalli/LiftoverIndel"
+
+[tool.setuptools]
+packages = ["liftover_indels"]

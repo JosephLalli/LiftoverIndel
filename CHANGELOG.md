@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Add a Python API in `python/liftover_indels`, a ctypes binding to the same C
+  library, with no third-party dependency and nothing to compile beyond the library.
+  Positions are 0-based to match the C API and cyvcf2; a variant that does not lift
+  is returned with its status rather than raised.
+- Verified over the same 29,020 chr21 variants as the C++ client with zero
+  mismatches, and RSS is flat across 290,200 lifts. At 7.3 us per variant it is 16x
+  faster than the Python implementation it replaces, the ctypes crossing costing
+  1.7 us on top of the C API's 5.6 us.
+
 - Remove scratch build artifacts committed by mistake: a compiled binary, a
   throwaway C file and a symlink to an absolute host path, none of which anything
   referenced. Ignore `tmp_*/` so it cannot recur.

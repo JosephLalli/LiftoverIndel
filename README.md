@@ -161,13 +161,16 @@ leaves the marginal cost of lifting one variant:
 
 | | Load | Per variant | Throughput |
 |---|---|---|---|
-| Python | 9.83 s | 118 us | 8,500 variants/s |
+| `liftover_indels.py` | 9.83 s | 118 us | 8,500 variants/s |
 | Rust, command line | 0.24 s | 15.5 us | 64,000 variants/s |
+| Rust, Python API | 0.26 s | 7.3 us | 137,000 variants/s |
 | Rust, C API | 0.25 s | 5.6 us | 177,000 variants/s |
 
 The C API is faster than the command line tool because it does no VCF work: it
 neither parses records nor decodes and rewrites genotypes for 107 samples, which is
-most of the command line tool's remaining 10 us.
+most of the command line tool's remaining 10 us. The Python API reaches the same
+engine through ctypes and pays 1.7 us per call for the crossing, which leaves it
+16 times faster per variant than the Python implementation it replaces.
 
 Haplotype realignment is the most expensive stage and the two implementations pay
 very differently for it. It adds 59 us per variant to the Python, roughly doubling
@@ -248,6 +251,56 @@ Notes:
 integration test: over 29,020 chr21 variants it reproduces the command line tool's
 partition and values exactly (25,550 lifted, 1,753 unliftable, 1,665 reference
 mismatches, 52 multiple-overlap), and valgrind reports every heap block freed.
+
+### Python API
+
+`python/liftover_indels` binds the same engine through `ctypes`. There is nothing
+to compile beyond the library itself, and no third-party dependency.
+
+```
+cargo build --release          # produces target/release/libliftover_indels.so
+pip install ./python           # or just put python/ on PYTHONPATH
+```
+
+```python
+from liftover_indels import LiftOver
+
+with LiftOver("chm13v2-grch38.chain", "grch38-chm13v2.sort.bcf",
+              "GRCh38.fasta", contigs=["chr21"]) as lo:
+    r = lo.lift("chr21", 20000049, "C", "T")   # 0-based
+    if r.ok:
+        print(r.chrom, r.pos, r.ref, r.alt, r.flipped, r.realigned)
+    else:
+        print(r.status.name, r.message)
+```
+
+Positions are **0-based**, matching the C API and cyvcf2's `variant.start`, and the
+alleles passed in are the source assembly's.
+
+A variant that does not lift is returned, not raised: `r.status` is one of
+`UNLIFTABLE`, `MULTIPLE_OVERLAPS` or `REF_MISMATCH`, the same three buckets the
+command line tool writes as sidecar files. `LiftoverError` is reserved for a bad
+argument or an unreadable input.
+
+The shared library is searched for in this order, and `LIFTOVER_INDELS_LIB`
+overrides it: next to the package, `target/release/` relative to a source checkout,
+`sys.prefix/lib`, `~/usr/local/lib`, `/usr/local/lib`, then the system loader.
+`liftover_indels.library_path()` reports which one would be used.
+
+Notes:
+
+- Loading dominates the cost, so build one `LiftOver` and reuse it. Naming only the
+  contigs you need keeps the rest of the target reference out of memory.
+- A `LiftOver` is safe to share between threads: the engine is immutable once
+  loaded and each thread gets its own result buffer.
+- The binding works at the allele level, like the C API. `r.flipped` means REF and
+  ALT were swapped and sample genotypes must be rewritten by the caller; it is
+  meaningful only when the status is OK. `already_flipped` rejects a *second* flip
+  at a position.
+
+Verified over the same 29,020 chr21 variants as the C++ client: identical results,
+zero mismatches. RSS is flat across 290,200 lifts, so the per-call strings are
+released as they should be.
 
 ### Output Files
 
